@@ -1,0 +1,6 @@
+streamlit
+pandas
+requests
+together>=0.2.0
+predibase
+
