@@ -8,6 +8,8 @@ from convert_to_jsonl import convert_csv_to_jsonl
 from model_factory import ModelFactory, ModelProvider
 from pathlib import Path
 import sys
+from database import Database
+import unicodedata
 
 
 REQUIRED_COLUMNS = ['Description', 'Amount', 'Category', 'PaymentAccount', 'Vendor', 'TaxCategory']
@@ -27,9 +29,17 @@ def read_csv_with_encoding(file):
     
     for encoding in encodings:
         try:
-            # Reset file pointer to start
-            file.seek(0)
+            if hasattr(file, 'seek'):
+                file.seek(0)  # Reset file pointer for each attempt
             df = pd.read_csv(file, encoding=encoding)
+            
+            # Normalize Unicode characters in Description column
+            if 'Description' in df.columns:
+                df['Description'] = df['Description'].apply(lambda x: unicodedata.normalize('NFKD', str(x))
+                                                          .encode('ascii', 'ignore')
+                                                          .decode('ascii')
+                                                          if isinstance(x, str) else x)
+            
             return df, None
         except UnicodeDecodeError:
             continue
@@ -54,33 +64,46 @@ def cleanup_temp_files(files):
 def process_predictions(df, model_id, api):
     """Process predictions for each transaction in the dataframe"""
     results = []
+    raw_responses = []  # Store raw responses for debugging
     progress_bar = st.progress(0)
     
     # Create a container for debug output
     if st.session_state.get('debug_mode'):
-        debug_container = st.expander("Debug Information", expanded=True)
+        debug_container = st.expander("Debug Information (LLM Interactions)", expanded=True)
     
-    for idx, row in df.iterrows():
-        # Create transaction details
-        details = {
-            "Description": row['Description'],
-            "Amount": row['Amount'],
-            "Category": row['Category'],
-            "PaymentAccount": row['PaymentAccount']
-        }
+    # Process transactions in batches of 3
+    batch_size = 3
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i+batch_size]
         
-        # Get prediction
-        prediction, error = api.predict(model_id, details)
+        # Create transaction details for batch
+        batch_details = []
+        for _, row in batch.iterrows():
+            batch_details.append({
+                "Description": row['Description'],
+                "Category": row['Category']
+            })
         
+        # Get predictions for batch
+        prediction, error = api.predict(model_id, batch_details)
+        raw_responses.extend([prediction] * len(batch))
+        
+        # Show debug information
         if st.session_state.get('debug_mode'):
             with debug_container:
-                st.markdown(f"### Transaction {idx + 1}")
-                st.markdown("**Input:**")
-                st.json(details)
-                st.markdown("**Raw Model Output:**")
-                st.text(prediction if prediction else error)
+                st.markdown(f"### Batch {i//batch_size + 1}")
+                
+                # Show input prompt
+                st.markdown("**🔤 Input Prompt:**")
+                st.code(api.last_prompt if hasattr(api, 'last_prompt') else "Prompt not available", language="text")
+                
+                # Show raw output
+                st.markdown("**📝 Raw LLM Response:**")
+                st.code(prediction if prediction else f"Error: {error}", language="text")
+                
+                # Show parsed output
                 if prediction:
-                    st.markdown("**Parsed Response:**")
+                    st.markdown("**🔍 Parsed Response:**")
                     try:
                         parsed = json.loads(prediction)
                         st.json(parsed)
@@ -89,19 +112,24 @@ def process_predictions(df, model_id, api):
                 st.markdown("---")
         
         if error:
-            results.append({"error": error})
+            results.extend([{"error": error}] * len(batch))
         else:
             try:
-                results.append(json.loads(prediction))
+                parsed = json.loads(prediction)
+                results.extend(parsed if isinstance(parsed, list) else [parsed])
             except json.JSONDecodeError:
-                results.append({"error": "Failed to parse prediction"})
+                results.extend([{"error": "Failed to parse prediction"}] * len(batch))
         
         # Update progress
-        progress_bar.progress((idx + 1) / len(df))
+        progress_bar.progress((i + len(batch)) / len(df))
     
     # Add predictions to dataframe
-    df['Predicted_Vendor'] = [r.get('vendor', '') if isinstance(r, dict) else '' for r in results]
-    df['Predicted_TaxCategory'] = [r.get('tax_category', '') if isinstance(r, dict) else '' for r in results]
+    df['Predicted_Vendor'] = [r.get('Vendor', '') if isinstance(r, dict) else '' for r in results]
+    df['Predicted_TaxCategory'] = [r.get('TaxCategory', '') if isinstance(r, dict) else '' for r in results]
+    
+    # Store predictions in database
+    db = Database()
+    db.store_predictions(df, results, model_id, raw_responses)
     
     return df
 
@@ -264,6 +292,39 @@ def show_active_jobs(api):
         }
     )
 
+def show_predictions_history():
+    """Show prediction history from database"""
+    st.subheader("Previous Predictions")
+    
+    db = Database()
+    predictions = db.get_predictions()
+    
+    if predictions:
+        df = pd.DataFrame(predictions)
+        st.dataframe(
+            df,
+            column_config={
+                "description": "Description",
+                "category": "Category",
+                "payment_account": "Account",
+                "predicted_vendor": "Predicted Vendor",
+                "predicted_tax_category": "Predicted Tax Category",
+                "created_at": "Processed At",
+                "model_id": "Model ID"
+            }
+        )
+        
+        # Download button for history
+        csv = df.to_csv(index=False)
+        st.download_button(
+            label="Download History CSV",
+            data=csv,
+            file_name="prediction_history.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No prediction history available")
+
 def main():
     print(sys.executable)
     # Add debug mode toggle at the top
@@ -271,7 +332,7 @@ def main():
     # Store debug mode in session state
     st.session_state['debug_mode'] = debug_mode
     
-    st.title("Tax Classification Model Fine-tuning")
+    st.title("Tax Classification Assistant")
     
     # Provider selection with Predibase as default
     provider = st.radio(
@@ -302,107 +363,55 @@ def main():
             api = ModelFactory.create(provider, api_key, debug=debug_mode)
         
         # Create tabs for different sections
-        tab1, tab2 = st.tabs(["Fine-tune Model", "Get Predictions"])
+        tab1, tab2 = st.tabs(["Process Transactions", "View History"])
         
         with tab1:
+            # Account type selection
+            account_type = st.radio(
+                "Select Account Type",
+                options=["Personal", "Business"],
+                horizontal=True
+            )
             
-            # Existing fine-tuning code
-            st.subheader("Sample Data")
-            sample_data = get_sample_data()
-            if sample_data:
-                st.download_button(
-                    label="Download Sample CSV",
-                    data=sample_data,
-                    file_name="sample_transactions.csv",
-                    mime="text/csv",
-                    help="Download a sample CSV file with the required format"
-                )
-            
-            # File upload and validation
-            st.subheader("Upload Your Data")
-            uploaded_file = st.file_uploader("Upload CSV file", type=['csv'])
+            # File upload for predictions
+            uploaded_file = st.file_uploader("Upload Amex CSV", type=['csv'])
             
             if uploaded_file is not None:
-                # Read CSV with appropriate encoding
                 df, error = read_csv_with_encoding(uploaded_file)
-                
                 if error:
                     st.error(error)
-                    return
-                
-                if df is not None:
-                    # Validate CSV structure
-                    is_valid, missing_cols = validate_csv(df)
-                    
-                    if not is_valid:
-                        st.error(f"CSV is missing required columns: {', '.join(missing_cols)}")
-                        st.info("Please ensure your CSV has all required columns. You can download the sample CSV for reference.")
-                        return
-                    
-                    st.success("CSV file validated successfully!")
-                    
-                    # Show data preview
-                    st.subheader("Data Preview")
-                    
-                    # Calculate number of rows to show (3 from top and bottom if enough rows exist)
-                    n_rows = 3
-                    if len(df) > (n_rows * 2):
-                        preview_df = pd.concat([df.head(n_rows), df.tail(n_rows)])
-                        st.caption(f"Showing first and last {n_rows} rows of {len(df)} total rows")
-                    else:
-                        preview_df = df
-                        st.caption(f"Showing all {len(df)} rows")
-                    
-                    st.dataframe(preview_df)
-                    
-                    if st.button("Start Fine-tuning"):
-                        with st.spinner("Training..."):
-                            temp_jsonl = None
-                            try:
-                                # Create temporary file
-                                temp_jsonl = tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False).name
+                else:
+                    # Prepare data
+                    try:
+                        df_prepared = prepare_amex_data(df, account_type)
+                        
+                        # Show preview of prepared data
+                        st.subheader("Data Preview")
+                        st.dataframe(df_prepared.head())
+                        
+                        if st.button("Predict"):
+                            with st.spinner("Processing predictions..."):
+                                # Process all rows
+                                result_df = process_predictions(df_prepared, None, api)
                                 
-                                # Convert to JSONL
-                                if convert_csv_to_jsonl(uploaded_file, temp_jsonl):
-                                    if debug_mode:
-                                        st.write(f"Created temp file: {temp_jsonl}")
-                                        st.write(f"File exists: {os.path.exists(temp_jsonl)}")
-                                        with open(temp_jsonl, 'r') as f:
-                                            st.write("First 200 chars:", f.read()[:200])
-                                    
-                                    # Start fine-tuning
-                                    job_id, error = api.start_finetuning(temp_jsonl)
-                                    
-                                    if error:
-                                        st.error(f"Error starting fine-tuning: {error}")
-                                    else:
-                                        # Monitor progress
-                                        progress_placeholder = st.empty()
-                                        while True:
-                                            status = api.get_finetuning_status(job_id)
-                                            if status["status"] == "completed":
-                                                st.success("Fine-tuning completed successfully!")
-                                                break
-                                            elif status["status"] == "error":
-                                                st.error(f"Fine-tuning failed: {status.get('error', 'Unknown error')}")
-                                                break
-                                            else:
-                                                progress = status.get("progress", 0)
-                                                progress_placeholder.progress(progress)
-                                                time.sleep(10)
-                                else:
-                                    st.error("Failed to convert data. Please check your CSV file.")
-                                    
-                            except Exception as e:
-                                st.error(f"Error during fine-tuning process: {str(e)}")
+                                # Show results
+                                st.subheader("Results")
+                                st.dataframe(result_df)
                                 
-                            finally:
-                                # Temporarily disable cleanup for debugging
-                                if debug_mode:
-                                    st.write(f"Debug: Keeping temp file for inspection: {temp_jsonl}")
+                                # Download button for results
+                                csv = result_df.to_csv(index=False)
+                                st.download_button(
+                                    label="Download Results CSV",
+                                    data=csv,
+                                    file_name="predictions.csv",
+                                    mime="text/csv"
+                                )
+                                
+                    except Exception as e:
+                        st.error(f"Error processing data: {str(e)}")
         
         with tab2:
-            show_predictions_section(api)
+            show_predictions_history()
 
 if __name__ == "__main__":
     main()
