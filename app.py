@@ -5,7 +5,7 @@ import tempfile
 import time
 import json
 from convert_to_jsonl import convert_csv_to_jsonl
-from together_api import TogetherAPI
+from model_factory import ModelFactory, ModelProvider
 from pathlib import Path
 import sys
 
@@ -138,10 +138,10 @@ def show_predictions_section(api):
     model_data = []
     for model in models:
         model_data.append({
-            "ID": model.id,
-            "Name": model.output_name,
-            "Created": model.created_at,
-            "Status": model.status
+            "ID": model["id"],
+            "Name": model["output_name"],
+            "Created": model["created_at"],
+            "Status": model["status"]
         })
     
     if model_data:
@@ -211,10 +211,20 @@ def show_predictions_section(api):
     else:
         st.warning("No models available")
 
-# Load default API key from .env file or environment variable
-def get_default_api_key():
+def get_api_key(provider: ModelProvider) -> str:
+    """Get API key for selected provider from .env file"""
+    # Map provider to environment variable name
+    key_map = {
+        ModelProvider.TOGETHER: 'TOGETHER_API_KEY',
+        ModelProvider.PREDIBASE: 'PREDIBASE_API_KEY'
+    }
+    
+    env_var = key_map.get(provider)
+    if not env_var:
+        return None
+        
     # First try environment variable
-    api_key = os.getenv('TOGETHER_API_KEY')
+    api_key = os.getenv(env_var)
     
     if not api_key:
         # Try reading from .env file
@@ -222,11 +232,37 @@ def get_default_api_key():
         if env_path.exists():
             with open(env_path) as f:
                 for line in f:
-                    if line.startswith('TOGETHER_API_KEY='):
+                    if line.startswith(f'{env_var}='):
                         api_key = line.split('=')[1].strip()
                         break
     
     return api_key
+
+def show_active_jobs(api):
+    """Show active fine-tuning jobs"""
+    st.subheader("Active Jobs")
+    
+    jobs, error = api.get_active_jobs()
+    if error:
+        st.error(f"Error loading active jobs: {error}")
+        return
+        
+    if not jobs:
+        st.info("No active fine-tuning jobs")
+        return
+        
+    # Show jobs in a table
+    job_data = pd.DataFrame(jobs)
+    st.dataframe(
+        job_data,
+        column_config={
+            "id": "Job ID",
+            "name": "Name",
+            "status": "Status",
+            "progress": "Progress",
+            "created_at": "Created At"
+        }
+    )
 
 def main():
     print(sys.executable)
@@ -237,26 +273,39 @@ def main():
     
     st.title("Tax Classification Model Fine-tuning")
     
-    # API Key input with default value
-    default_key = get_default_api_key()
+    # Provider selection with Predibase as default
+    provider = st.radio(
+        "Select Provider",
+        options=[ModelProvider.PREDIBASE, ModelProvider.TOGETHER],
+        format_func=lambda x: x.value.title(),
+        horizontal=True,
+        index=0
+    )
+    
+    # Get API key for selected provider
+    default_key = get_api_key(provider)
     api_key = st.text_input(
-        "Together.ai API Key", 
+        f"{provider.value.title()} API Key", 
         value=default_key if default_key else "",
         type="password"
     )
     
     if debug_mode:
         st.sidebar.write("Debug Information:")
+        st.sidebar.write(f"Selected Provider: {provider.value}")
         st.sidebar.write(f"Default API Key found: {bool(default_key)}")
         st.sidebar.write(f"Current API Key length: {len(api_key) if api_key else 0}")
     
     if api_key:
-        api = TogetherAPI(api_key, debug=debug_mode)
+        # Create API client based on selected provider
+        with st.spinner("Initializing API client..."):
+            api = ModelFactory.create(provider, api_key, debug=debug_mode)
         
         # Create tabs for different sections
         tab1, tab2 = st.tabs(["Fine-tune Model", "Get Predictions"])
         
         with tab1:
+            
             # Existing fine-tuning code
             st.subheader("Sample Data")
             sample_data = get_sample_data()
@@ -354,6 +403,7 @@ def main():
         
         with tab2:
             show_predictions_section(api)
+            show_active_jobs(api)
     else:
         st.warning("Please enter your Together.ai API key to start")
 
