@@ -1,6 +1,7 @@
 from model_api import ModelAPI
 from predibase import Predibase,FinetuningConfig, DeploymentConfig
 import time
+import json
 
 class PredibaseAPI(ModelAPI):
     """Predibase implementation"""
@@ -93,28 +94,39 @@ class PredibaseAPI(ModelAPI):
         """Make prediction using Predibase SDK"""
         try:
             # Format input exactly like training data
+            input_json = {
+                "Description": transaction_details['Description'],
+                "Category": transaction_details['Category'],
+                "PaymentAccount": transaction_details['PaymentAccount']
+            }
+            
             prompt = (
-                f"Description: {transaction_details['Description']}\n"
-                f"Category: {transaction_details['Category']}\n"
-                f"PaymentAccount: {transaction_details['PaymentAccount']}"
+                "Given the following details in JSON format, extract the Vendor and TaxCategory "
+                "and provide the response in JSON format. Input:\n"
+                f"{json.dumps(input_json, indent=2)}\n"
+                "Output the result as:\n"
+                "{\n"
+                "  \"Vendor\": \"<Vendor>\",\n"
+                "  \"TaxCategory\": \"<TaxCategory>\"\n"
+                "}"
             )
             
             if self.debug:
                 self._log(f"Prediction prompt: {prompt}")
             
             # Get prediction using deployments client
-#            lorax_client = self.pb.deployments.client("llama-3-1-8b-instruct")
-#            response = lorax_client.generate(
-#                prompt,
-#                adapter_id=model_id,  # This should be the adapter_id from fine-tuning
-#                max_new_tokens=100,
-#                temperature=0
-#            )
+            lorax_client = self.pb.deployments.client("llama-3-1-8b-instruct")
+            response = lorax_client.generate(
+                prompt,
+                adapter_id=model_id,  # This should be the adapter_id from fine-tuning
+                max_new_tokens=100,
+                temperature=0
+            )
             
             if self.debug:
                 self._log(f"Prediction response: {response}")
             
-#            return response.generated_text.strip(), None
+            return response.generated_text.strip(), None
             
         except Exception as e:
             self._log(f"Error in prediction: {str(e)}")

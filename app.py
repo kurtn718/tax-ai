@@ -403,9 +403,6 @@ def main():
         
         with tab2:
             show_predictions_section(api)
-            show_active_jobs(api)
-    else:
-        st.warning("Please enter your Together.ai API key to start")
 
 if __name__ == "__main__":
     main()
