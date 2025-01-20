@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 from database import Database
 import unicodedata
+from auth import init_auth, login, signup, logout
 
 
 REQUIRED_COLUMNS = ['Description', 'Amount', 'Category', 'PaymentAccount', 'Vendor', 'TaxCategory']
@@ -62,62 +63,89 @@ def cleanup_temp_files(files):
             pass
 
 def process_predictions(df, model_id, api, preview_only=True):
-    """Process predictions for each transaction in the dataframe"""
-    results = []
-    raw_responses = []
-    progress_bar = st.progress(0)
-    
-    # Only process first 10 rows if preview
-    rows_to_process = df.head(10) if preview_only else df
-    total_rows = len(rows_to_process)
-    
-    for idx, row in rows_to_process.iterrows():
-        # Create transaction details
-        transaction = {
-            "Description": row['Description'],
-            "Category": row['Category']
-        }
+    try:
+        results = []
+        raw_responses = []
+        progress_bar = st.progress(0)
         
-        # Get prediction
-        prediction, error = api.predict(model_id, [transaction])
-        raw_responses.append(prediction)
+        # Only process first 2 rows if preview
+        rows_to_process = df.head(2) if preview_only else df
+        total_rows = len(rows_to_process)
         
-        # Show debug information
         if st.session_state.get('debug_mode'):
-            with st.expander(f"Debug: Transaction {idx + 1}", expanded=False):
-                st.markdown("**🔤 Input:**")
-                st.json(transaction)
-                st.markdown("**📝 Raw Response:**")
-                st.code(prediction if prediction else f"Error: {error}")
+            st.write("Processing rows:", total_rows)
         
-        if error:
-            results.append({"error": error})
-            st.error(f"Error processing transaction {idx + 1}: {error}")
-        else:
-            try:
-                parsed = json.loads(prediction)
-                if isinstance(parsed, list):
-                    results.extend(parsed)
-                else:
-                    results.append(parsed)
-            except json.JSONDecodeError:
-                error_msg = "Failed to parse prediction response"
-                results.append({"error": error_msg})
-                st.error(f"Error processing transaction {idx + 1}: {error_msg}")
+        for idx, row in rows_to_process.iterrows():
+            # Create transaction details
+            transaction = {
+                "Description": row['Description'],
+                "Category": row['Category']
+            }
+            
+            # Get prediction
+            prediction, error = api.predict(model_id, [transaction])
+            raw_responses.append(prediction)
+            
+            # Show debug information
+            if st.session_state.get('debug_mode'):
+                with st.expander(f"Debug: Transaction {idx + 1}", expanded=False):
+                    st.markdown("**🔤 Input:**")
+                    st.json(transaction)
+                    st.markdown("**📝 Raw Response:**")
+                    st.code(prediction if prediction else f"Error: {error}")
+            
+            if error:
+                results.append({"error": error})
+                st.error(f"Error processing transaction {idx + 1}: {error}")
+            else:
+                try:
+                    # Parse the prediction string into JSON
+                    parsed = json.loads(prediction)
+                    # Handle both single object and array responses
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                results.append(item)
+                            else:
+                                results.append({"error": "Invalid response format"})
+                    elif isinstance(parsed, dict):
+                        results.append(parsed)
+                    else:
+                        results.append({"error": "Invalid response format"})
+                except (json.JSONDecodeError, TypeError) as e:
+                    error_msg = f"Failed to parse prediction response: {str(e)}"
+                    results.append({"error": error_msg})
+                    st.error(f"Error processing transaction {idx + 1}: {error_msg}")
+            
+            # Update progress
+            progress_bar.progress((idx + 1) / total_rows)
         
-        # Update progress
-        progress_bar.progress((idx + 1) / total_rows)
-    
-    # Add predictions to dataframe
-    result_df = rows_to_process.copy()
-    result_df['Predicted_Vendor'] = [r.get('Vendor', 'ERROR') if isinstance(r, dict) and not isinstance(r, str) and 'error' not in r else r.get('error', 'ERROR') for r in results]
-    result_df['Predicted_TaxCategory'] = [r.get('TaxCategory', 'ERROR') if isinstance(r, dict) and not isinstance(r, str) and 'error' not in r else '' for r in results]
-    
-    # Store predictions in database
-    db = Database()
-    db.store_predictions(result_df, results, model_id, raw_responses)
-    
-    return result_df, df[10:] if preview_only else None
+        # Add predictions to dataframe
+        result_df = rows_to_process.copy()
+        result_df['Predicted_Vendor'] = [
+            r.get('Vendor', 'ERROR') if isinstance(r, dict) and 'error' not in r 
+            else r.get('error', 'ERROR') if isinstance(r, dict) 
+            else 'ERROR' 
+            for r in results
+        ]
+        result_df['Predicted_TaxCategory'] = [
+            r.get('TaxCategory', '') if isinstance(r, dict) and 'error' not in r 
+            else '' 
+            for r in results
+        ]
+        
+        # Store predictions in database
+        db = Database(st.session_state.supabase)
+        db.store_predictions(result_df, results, model_id, raw_responses)
+        
+        return result_df, df[2:] if preview_only else None
+        
+    except Exception as e:
+        st.error(f"Error in process_predictions: {str(e)}")
+        if st.session_state.get('debug_mode'):
+            import traceback
+            st.code(traceback.format_exc())
+        return None, None
 
 def prepare_amex_data(df, account_type):
     """Prepare Amex CSV data for predictions"""
@@ -201,7 +229,7 @@ def show_predictions_section(api):
                 st.subheader("Data Preview")
                 st.dataframe(df_prepared.head())
                 
-                if st.button("Process First 10 Transactions"):
+                if st.button("Process First 2 Transactions"):
                     with st.spinner("Processing initial transactions..."):
                         result_df, remaining_df = process_predictions(df_prepared, selected_model, api, preview_only=True)
                         
@@ -325,134 +353,152 @@ def show_predictions_history():
         st.info("No prediction history available")
 
 def main():
-    print(sys.executable)
-    # Add debug mode toggle at the top
-    debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
-    # Store debug mode in session state
-    st.session_state['debug_mode'] = debug_mode
+    # Initialize authentication
+    init_auth()
     
-    st.title("Tax Classification Assistant")
+    # Show auth status in sidebar
+    with st.sidebar:
+        if st.session_state.user:
+            st.write(f"Logged in as: {st.session_state.user.email}")
+            if st.button("Logout"):
+                logout()
+        else:
+            tab1, tab2 = st.tabs(["Login", "Sign Up"])
+            with tab1:
+                login()
+            with tab2:
+                signup()
     
-    # Provider selection with Predibase as default
-    provider = st.radio(
-        "Select Provider",
-        options=[ModelProvider.PREDIBASE, ModelProvider.TOGETHER],
-        format_func=lambda x: x.value.title(),
-        horizontal=True,
-        index=0
-    )
-    
-    # Get API key and tenant ID for selected provider
-    default_key = get_env_value('PREDIBASE_API_KEY' if provider == ModelProvider.PREDIBASE else 'TOGETHER_API_KEY')
-    api_key = st.text_input(
-        f"{provider.value.title()} API Key", 
-        value=default_key if default_key else "",
-        type="password"
-    )
-
-    # Add tenant ID input for Predibase
-    tenant_id = None
-    if provider == ModelProvider.PREDIBASE:
-        default_tenant = get_env_value('PREDIBASE_TENANT_ID')
-        tenant_id = st.text_input(
-            "Predibase Tenant ID",
-            value=default_tenant if default_tenant else "",
-            type="password",
-            help="Enter your Predibase tenant ID"
+    # Only show main app if user is logged in
+    if st.session_state.user:
+        print(sys.executable)
+        # Add debug mode toggle at the top
+        debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
+        # Store debug mode in session state
+        st.session_state['debug_mode'] = debug_mode
+        
+        st.title("Tax Classification Assistant")
+        
+        # Provider selection with Predibase as default
+        provider = st.radio(
+            "Select Provider",
+            options=[ModelProvider.PREDIBASE, ModelProvider.TOGETHER],
+            format_func=lambda x: x.value.title(),
+            horizontal=True,
+            index=0
         )
-        if tenant_id:
-            os.environ['PREDIBASE_TENANT_ID'] = tenant_id
-    
-    if debug_mode:
-        st.sidebar.write("Debug Information:")
-        st.sidebar.write(f"Selected Provider: {provider.value}")
-        st.sidebar.write(f"Default API Key found: {bool(default_key)}")
-        st.sidebar.write(f"Current API Key length: {len(api_key) if api_key else 0}")
+        
+        # Get API key and tenant ID for selected provider
+        default_key = get_env_value('PREDIBASE_API_KEY' if provider == ModelProvider.PREDIBASE else 'TOGETHER_API_KEY')
+        api_key = st.text_input(
+            f"{provider.value.title()} API Key", 
+            value=default_key if default_key else "",
+            type="password"
+        )
+
+        # Add tenant ID input for Predibase
+        tenant_id = None
         if provider == ModelProvider.PREDIBASE:
-            st.sidebar.write(f"Tenant ID: {tenant_id}")
-    
-    # Only proceed if we have all required credentials
-    if api_key and (provider != ModelProvider.PREDIBASE or tenant_id):
-        # Create API client based on selected provider
-        with st.spinner("Initializing API client..."):
-            api = ModelFactory.create(provider, api_key, debug=debug_mode)
-        
-        # Create tabs for different sections
-        tab1, tab2 = st.tabs(["Process Transactions", "View History"])
-        
-        with tab1:
-            # Account type selection
-            account_type = st.radio(
-                "Select Account Type",
-                options=["Personal", "Business"],
-                horizontal=True
+            default_tenant = get_env_value('PREDIBASE_TENANT_ID')
+            tenant_id = st.text_input(
+                "Predibase Tenant ID",
+                value=default_tenant if default_tenant else "",
+                type="password",
+                help="Enter your Predibase tenant ID"
             )
-            
-            # File upload for predictions
-            uploaded_file = st.file_uploader("Upload Amex CSV", type=['csv'])
-            
-            if uploaded_file is not None:
-                df, error = read_csv_with_encoding(uploaded_file)
-                if error:
-                    st.error(error)
-                else:
-                    try:
-                        df_prepared = prepare_amex_data(df, account_type)
-                        
-                        # Show preview of prepared data
-                        st.subheader("Data Preview")
-                        st.dataframe(df_prepared.head())
-                        
-                        if st.button("Process First 10 Transactions"):
-                            with st.spinner("Processing initial transactions..."):
-                                result_df, remaining_df = process_predictions(df_prepared, None, api, preview_only=True)
-                                
-                                # Show results
-                                st.subheader("Preview Results")
-                                st.dataframe(result_df)
-                                
-                                # Show action buttons
-                                col1, col2, col3 = st.columns(3)
-                                
-                                with col1:
-                                    if st.button("Process Remaining Transactions"):
-                                        if remaining_df is not None and not remaining_df.empty:
-                                            with st.spinner("Processing remaining transactions..."):
-                                                full_result_df, _ = process_predictions(remaining_df, None, api, preview_only=False)
-                                                st.subheader("All Results")
-                                                st.dataframe(pd.concat([result_df, full_result_df]))
-                                                
-                                                # Download button for all results
-                                                csv = pd.concat([result_df, full_result_df]).to_csv(index=False)
-                                                st.download_button(
-                                                    label="Download All Results CSV",
-                                                    data=csv,
-                                                    file_name="all_predictions.csv",
-                                                    mime="text/csv"
-                                                )
-                                
-                                with col2:
-                                    if st.button("Custom Mappings", disabled=True):
-                                        st.info("Custom mappings feature coming soon!")
-                                
-                                with col3:
-                                    if st.button("Custom Tax Categories", disabled=True):
-                                        st.info("Custom tax categories feature coming soon!")
-                                
-                                # Download button for preview results
-                                csv = result_df.to_csv(index=False)
-                                st.download_button(
-                                    label="Download Preview Results CSV",
-                                    data=csv,
-                                    file_name="preview_predictions.csv",
-                                    mime="text/csv"
-                                )
-                        
-                    except Exception as e:
-                        st.error(f"Error processing data: {str(e)}")
+            if tenant_id:
+                os.environ['PREDIBASE_TENANT_ID'] = tenant_id
         
-        with tab2:
-            show_predictions_history()
+        if debug_mode:
+            st.sidebar.write("Debug Information:")
+            st.sidebar.write(f"Selected Provider: {provider.value}")
+            st.sidebar.write(f"Default API Key found: {bool(default_key)}")
+            st.sidebar.write(f"Current API Key length: {len(api_key) if api_key else 0}")
+            if provider == ModelProvider.PREDIBASE:
+                st.sidebar.write(f"Tenant ID: {tenant_id}")
+        
+        # Only proceed if we have all required credentials
+        if api_key and (provider != ModelProvider.PREDIBASE or tenant_id):
+            # Create API client based on selected provider
+            with st.spinner("Initializing API client..."):
+                api = ModelFactory.create(provider, api_key, debug=debug_mode)
+            
+            # Create tabs for different sections
+            tab1, tab2 = st.tabs(["Process Transactions", "View History"])
+            
+            with tab1:
+                # Account type selection
+                account_type = st.radio(
+                    "Select Account Type",
+                    options=["Personal", "Business"],
+                    horizontal=True
+                )
+                
+                # File upload for predictions
+                uploaded_file = st.file_uploader("Upload Amex CSV", type=['csv'])
+                
+                if uploaded_file is not None:
+                    df, error = read_csv_with_encoding(uploaded_file)
+                    if error:
+                        st.error(error)
+                    else:
+                        try:
+                            df_prepared = prepare_amex_data(df, account_type)
+                            
+                            # Show preview of prepared data
+                            st.subheader("Data Preview")
+                            st.dataframe(df_prepared.head())
+                            
+                            if st.button("Process First 2 Transactions"):
+                                with st.spinner("Processing initial transactions..."):
+                                    result_df, remaining_df = process_predictions(df_prepared, None, api, preview_only=True)
+                                    
+                                    # Show results
+                                    st.subheader("Preview Results")
+                                    st.dataframe(result_df)
+                                    
+                                    # Show action buttons
+                                    col1, col2, col3 = st.columns(3)
+                                    
+                                    with col1:
+                                        if st.button("Process Remaining Transactions"):
+                                            if remaining_df is not None and not remaining_df.empty:
+                                                with st.spinner("Processing remaining transactions..."):
+                                                    full_result_df, _ = process_predictions(remaining_df, None, api, preview_only=False)
+                                                    st.subheader("All Results")
+                                                    st.dataframe(pd.concat([result_df, full_result_df]))
+                                                    
+                                                    # Download button for all results
+                                                    csv = pd.concat([result_df, full_result_df]).to_csv(index=False)
+                                                    st.download_button(
+                                                        label="Download All Results CSV",
+                                                        data=csv,
+                                                        file_name="all_predictions.csv",
+                                                        mime="text/csv"
+                                                    )
+                                    
+                                    with col2:
+                                        if st.button("Custom Mappings", disabled=True):
+                                            st.info("Custom mappings feature coming soon!")
+                                    
+                                    with col3:
+                                        if st.button("Custom Tax Categories", disabled=True):
+                                            st.info("Custom tax categories feature coming soon!")
+                                    
+                                    # Download button for preview results
+                                    csv = result_df.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download Preview Results CSV",
+                                        data=csv,
+                                        file_name="preview_predictions.csv",
+                                        mime="text/csv"
+                                    )
+                        
+                        except Exception as e:
+                            st.error(f"Error processing data: {str(e)}")
+            
+            with tab2:
+                show_predictions_history()
 
 if __name__ == "__main__":
     main()
