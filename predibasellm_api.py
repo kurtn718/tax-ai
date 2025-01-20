@@ -96,6 +96,45 @@ class PredibaseAPI(ModelAPI):
             self._log(f"Error getting models: {str(e)}")
             return None, str(e)
 
+    def _make_prediction_request(self, prompt, max_retries=3):
+        """Make prediction request with retries"""
+        url = f"{self.base_url}/{self.tenant_id}/deployments/v2/llms/llama-3-3-70b-instruct/generate"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 1000,
+                "temperature": 0.1,
+                "top_p": 0.9
+            }
+        }
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                result = response.json()
+                raw_text = result.get('generated_text', '').strip()
+                
+                # Try to parse as JSON
+                parsed = self._extract_json(raw_text)
+                if parsed:
+                    return parsed, None
+                    
+                if self.debug:
+                    self._log(f"Attempt {attempt + 1} failed to get valid JSON")
+                    
+            except Exception as e:
+                if self.debug:
+                    self._log(f"Attempt {attempt + 1} failed with error: {str(e)}")
+                if attempt == max_retries - 1:
+                    return None, str(e)
+                    
+        return None, "Failed to get valid JSON after all retries"
+
     def predict(self, model_id, transactions):
         """Make prediction using Predibase REST API"""
         all_results = []
@@ -115,13 +154,15 @@ class PredibaseAPI(ModelAPI):
                 prompt = (
                     "Given the following transaction details in JSON format, extract the Vendor and TaxCategory "
                     "and provide the response as a single JSON object.\n\n"
-                    "You can strip things like GPay and City / State. Note that the City might not be separated by a space from the "
-                    "actual vendor name (i.e. given the description GPay LENNYSUBSATLANTA GA - we would only want LENNY SUB). "
-                    "If you recognize a word that is compressed you can expand it.\n\n"
+                    "The response MUST be a valid JSON object with exactly two fields:\n"
+                    "- Vendor (string): The vendor name with city/state removed\n"
+                    "- TaxCategory (string): Must be one of the allowed categories\n\n"
+                    "Example response format:\n"
+                    '{"Vendor": "AMAZON", "TaxCategory": "Supplies"}\n\n'
                     f"Words that I would like corrected:\n{corrections_str}\n\n"
                     f"Tax Categories are:\n{categories_str}\n\n"
                     f"Input: {json.dumps(input_json, indent=2)}\n\n"
-                    "Output must be a single JSON object with Vendor and TaxCategory. "
+                    "In the event that it is not clear who the Vendor is do not hallucinate - simply output Unknown. Output must be a single JSON object with Vendor and TaxCategory. "
                     "Only output valid JSON object. No other text."
                 )
                 
@@ -132,59 +173,12 @@ class PredibaseAPI(ModelAPI):
                     self._log(f"Prediction prompt: {prompt}")
 
                 # Make REST API call
-                url = f"{self.base_url}/{self.tenant_id}/deployments/v2/llms/llama-3-3-70b-instruct/generate"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
-                }
-                payload = {
-                    "inputs": prompt,
-                    "parameters": {
-                        "max_new_tokens": 1000,
-                        "temperature": 0.1,
-                        "top_p": 0.9
-                    }
-                }
-
-                if self.debug:
-                    self._log(f"Making API call to: {url}")
-                    
-                response = requests.post(url, json=payload, headers=headers)
-                response.raise_for_status()  # Raise exception for bad status codes
+                result, error = self._make_prediction_request(prompt)
                 
-                result = response.json()
-                raw_text = result.get('generated_text', '').strip()
-                
-                if self.debug:
-                    self._log(f"Raw API response: {result}")
-                
-                # Try to find JSON by looking for opening/closing brackets
-                try:
-                    start_idx = raw_text.find('[')
-                    end_idx = raw_text.rfind(']') + 1
-                    if start_idx >= 0 and end_idx > start_idx:
-                        json_text = raw_text[start_idx:end_idx]
-                    else:
-                        start_idx = raw_text.find('{')
-                        end_idx = raw_text.rfind('}') + 1
-                        if start_idx >= 0 and end_idx > start_idx:
-                            json_text = raw_text[start_idx:end_idx]
-                        else:
-                            json_text = raw_text
-                    
-                    # Validate it's valid JSON
-                    json.loads(json_text)  # This will raise an error if not valid JSON
-                    
-                    if self.debug:
-                        self._log(f"Raw response: {raw_text}")
-                        self._log(f"Extracted JSON: {json_text}")
-                    
-                    all_results.append(json_text)
-                    
-                except json.JSONDecodeError:
-                    if self.debug:
-                        self._log(f"Failed to extract valid JSON from: {raw_text}")
-                    all_results.append({"error": "Failed to get valid JSON response"})
+                if result:
+                    all_results.append(result)
+                else:
+                    all_results.append({"error": error})
                 
             except Exception as e:
                 self._log(f"Error processing transaction: {str(e)}")
@@ -216,3 +210,32 @@ class PredibaseAPI(ModelAPI):
         except Exception as e:
             self._log(f"Error getting active jobs: {str(e)}")
             return None, str(e)
+
+    def _extract_json(self, text):
+        """Extract and validate JSON from text"""
+        try:
+            # First try to parse the whole text as JSON
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            
+            # Try to find JSON by looking for opening/closing brackets
+            start_idx = text.find('{')
+            end_idx = text.rfind('}') + 1
+            if start_idx >= 0 and end_idx > start_idx:
+                json_text = text[start_idx:end_idx]
+                parsed = json.loads(json_text)
+                
+                # Validate it has required fields
+                if "Vendor" in parsed and "TaxCategory" in parsed:
+                    return parsed
+                    
+            if self.debug:
+                self._log(f"Failed to extract valid JSON from: {text}")
+            return None
+            
+        except Exception as e:
+            if self.debug:
+                self._log(f"Error parsing JSON: {str(e)}")
+            return None

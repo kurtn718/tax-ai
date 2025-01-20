@@ -24,10 +24,10 @@ DEFAULT_TAX_CATEGORIES = [
     "Misc - Software and SaaS Tools",
     "Misc - Educational Expenses",
     "Misc - Memberships and Subscriptions",
-    "Misc - Marketing Materials",
     "Misc - Trade Shows and Conferences",
     "Misc - Home Office Expenses",
-    "Misc - Other Miscellaneous Business Expenses"
+    "Misc - Other",
+    "None"
 ]
 
 # Word corrections mapping

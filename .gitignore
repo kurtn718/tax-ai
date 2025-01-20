@@ -41,3 +41,6 @@ ENV/
 training_data/
 *.csv
 !sample-business-personal-accts.csv 
+
+# Streamlit secrets
+.streamlit/secrets.toml

@@ -92,25 +92,26 @@ def process_predictions(df, model_id, api, preview_only=True):
         
         if error:
             results.append({"error": error})
+            st.error(f"Error processing transaction {idx + 1}: {error}")
         else:
             try:
-                # Parse the prediction string into JSON
                 parsed = json.loads(prediction)
-                # Handle both single object and array responses
                 if isinstance(parsed, list):
                     results.extend(parsed)
                 else:
                     results.append(parsed)
             except json.JSONDecodeError:
-                results.append({"error": "Failed to parse prediction"})
+                error_msg = "Failed to parse prediction response"
+                results.append({"error": error_msg})
+                st.error(f"Error processing transaction {idx + 1}: {error_msg}")
         
         # Update progress
         progress_bar.progress((idx + 1) / total_rows)
     
     # Add predictions to dataframe
     result_df = rows_to_process.copy()
-    result_df['Predicted_Vendor'] = [r.get('Vendor', '') if isinstance(r, dict) and not isinstance(r, str) else '' for r in results]
-    result_df['Predicted_TaxCategory'] = [r.get('TaxCategory', '') if isinstance(r, dict) and not isinstance(r, str) else '' for r in results]
+    result_df['Predicted_Vendor'] = [r.get('Vendor', 'ERROR') if isinstance(r, dict) and not isinstance(r, str) and 'error' not in r else r.get('error', 'ERROR') for r in results]
+    result_df['Predicted_TaxCategory'] = [r.get('TaxCategory', 'ERROR') if isinstance(r, dict) and not isinstance(r, str) and 'error' not in r else '' for r in results]
     
     # Store predictions in database
     db = Database()
@@ -251,19 +252,16 @@ def show_predictions_section(api):
         st.warning("No models available")
 
 def get_env_value(key: str) -> str:
-    """Get value from environment or .env file"""
+    """Get value from environment or streamlit secrets"""
     # First try environment variable
     value = os.getenv(key)
     
     if not value:
-        # Try reading from .env file
-        env_path = Path('.env')
-        if env_path.exists():
-            with open(env_path) as f:
-                for line in f:
-                    if line.startswith(f'{key}='):
-                        value = line.split('=')[1].strip()
-                        break
+        # Try getting from streamlit secrets
+        try:
+            value = st.secrets[key]
+        except KeyError:
+            pass
     
     return value
 
