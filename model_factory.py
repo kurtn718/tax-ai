@@ -11,11 +11,11 @@ class ModelProvider(Enum):
 
 class ModelFactory:
     @staticmethod
-    def create(provider: ModelProvider, api_key: str, debug: bool = False) -> ModelAPI:
+    def create(provider: ModelProvider, api_key: str, debug: bool = False, tax_categories=None) -> ModelAPI:
 #        if provider == ModelProvider.TOGETHER:
 #            return TogetherAPI(api_key, debug)
 #        elif provider == ModelProvider.PREDIBASE:
 #            return PredibaseAPI(api_key, debug)
 #        else:
 #            raise ValueError(f"Unknown provider: {provider}") 
-        return predibasellm_api.PredibaseAPI(api_key, debug)
+        return predibasellm_api.PredibaseAPI(api_key, debug, tax_categories=tax_categories)

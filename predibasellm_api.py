@@ -1,13 +1,19 @@
+import requests
 from model_api import ModelAPI
 from predibase import Predibase,FinetuningConfig, DeploymentConfig
 import time
 import json
+import os
+from config import DEFAULT_TAX_CATEGORIES, WORD_CORRECTIONS
 
 class PredibaseAPI(ModelAPI):
-    """Predibase implementation"""
-    def __init__(self, api_key, debug=False):
+    """Predibase implementation using REST API"""
+    def __init__(self, api_key, debug=False, tax_categories=None):
         self.debug = debug
-        self.pb = Predibase(api_token=api_key)
+        self.api_key = api_key
+        self.tenant_id = os.getenv('PREDIBASE_TENANT_ID')
+        self.base_url = "https://serving.app.predibase.com"
+        self.tax_categories = tax_categories or DEFAULT_TAX_CATEGORIES
         if debug:
             self._log("Initialized Predibase client")
 
@@ -91,78 +97,100 @@ class PredibaseAPI(ModelAPI):
             return None, str(e)
 
     def predict(self, model_id, transactions):
-        """Make prediction using Predibase SDK"""
-        try:
-            # Format multiple transactions into JSON array
-            input_json = []
-            for txn in transactions:
-                input_json.append({
+        """Make prediction using Predibase REST API"""
+        all_results = []
+        
+        for txn in transactions:
+            try:
+                input_json = {
                     "Description": txn['Description'],
                     "Category": txn['Category']
-                })
-            
-            prompt = (
-                "Given the following details in JSON format, extract the Vendor and TaxCategory and provide the response in JSON format.\n\n"
-                "You can strip things like GPay and City / State. Note that the City might not be separated by a space from the "
-                "actual vendor name (i.e. given the description GPay LENNYSUBSATLANTA GA - we would only want LENNY SUB). "
-                "If you recognize a word that is compressed you can expand it.\n\n"
-                "Words that I would like corrected:\n"
-                '[ "LEARNPROMPIDOVER" : "LEARN PROMPTING" ]\n\n'
-                'Tax Categories are: [ "Advertising", "Other - Professional Development", "Interest", "Rent", '
-                '"Other - Miscellaneous", "Utilities", "Other - Dues and Subscriptions", "None" ]\n\n'
-                f"Input: {json.dumps(input_json, indent=2)}\n\n"
-                "Only output just the bare JSON. Do not include any other text, explanations, or formatting."
-            )
-            
-            # Store last prompt for debugging
-            self.last_prompt = prompt
-            
-            if self.debug:
-                self._log(f"Prediction prompt: {prompt}")
-            
-            # Get prediction using deployments client with Llama 3
-            lorax_client = self.pb.deployments.client("llama-3-3-70b-instruct")
-            response = lorax_client.generate(
-                prompt,
-                max_new_tokens=1000,
-                temperature=0,
-                top_p=0.9
-            )
-            
-            # Extract just the JSON part from the response
-            raw_text = response.generated_text.strip()
-            
-            # Try to find JSON by looking for opening/closing brackets
-            try:
-                start_idx = raw_text.find('[')
-                end_idx = raw_text.rfind(']') + 1
-                if start_idx >= 0 and end_idx > start_idx:
-                    json_text = raw_text[start_idx:end_idx]
-                else:
-                    start_idx = raw_text.find('{')
-                    end_idx = raw_text.rfind('}') + 1
+                }
+                
+                # Format word corrections for prompt
+                corrections_str = json.dumps(WORD_CORRECTIONS, indent=2)
+                # Format tax categories for prompt
+                categories_str = json.dumps(self.tax_categories, indent=2)
+                
+                prompt = (
+                    "Given the following transaction details in JSON format, extract the Vendor and TaxCategory "
+                    "and provide the response as a single JSON object.\n\n"
+                    "You can strip things like GPay and City / State. Note that the City might not be separated by a space from the "
+                    "actual vendor name (i.e. given the description GPay LENNYSUBSATLANTA GA - we would only want LENNY SUB). "
+                    "If you recognize a word that is compressed you can expand it.\n\n"
+                    f"Words that I would like corrected:\n{corrections_str}\n\n"
+                    f"Tax Categories are:\n{categories_str}\n\n"
+                    f"Input: {json.dumps(input_json, indent=2)}\n\n"
+                    "Output must be a single JSON object with Vendor and TaxCategory. "
+                    "Only output valid JSON object. No other text."
+                )
+                
+                # Store last prompt for debugging
+                self.last_prompt = prompt
+                
+                if self.debug:
+                    self._log(f"Prediction prompt: {prompt}")
+
+                # Make REST API call
+                url = f"{self.base_url}/{self.tenant_id}/deployments/v2/llms/llama-3-3-70b-instruct/generate"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                }
+                payload = {
+                    "inputs": prompt,
+                    "parameters": {
+                        "max_new_tokens": 1000,
+                        "temperature": 0.1,
+                        "top_p": 0.9
+                    }
+                }
+
+                if self.debug:
+                    self._log(f"Making API call to: {url}")
+                    
+                response = requests.post(url, json=payload, headers=headers)
+                response.raise_for_status()  # Raise exception for bad status codes
+                
+                result = response.json()
+                raw_text = result.get('generated_text', '').strip()
+                
+                if self.debug:
+                    self._log(f"Raw API response: {result}")
+                
+                # Try to find JSON by looking for opening/closing brackets
+                try:
+                    start_idx = raw_text.find('[')
+                    end_idx = raw_text.rfind(']') + 1
                     if start_idx >= 0 and end_idx > start_idx:
                         json_text = raw_text[start_idx:end_idx]
                     else:
-                        json_text = raw_text
+                        start_idx = raw_text.find('{')
+                        end_idx = raw_text.rfind('}') + 1
+                        if start_idx >= 0 and end_idx > start_idx:
+                            json_text = raw_text[start_idx:end_idx]
+                        else:
+                            json_text = raw_text
+                    
+                    # Validate it's valid JSON
+                    json.loads(json_text)  # This will raise an error if not valid JSON
+                    
+                    if self.debug:
+                        self._log(f"Raw response: {raw_text}")
+                        self._log(f"Extracted JSON: {json_text}")
+                    
+                    all_results.append(json_text)
+                    
+                except json.JSONDecodeError:
+                    if self.debug:
+                        self._log(f"Failed to extract valid JSON from: {raw_text}")
+                    all_results.append({"error": "Failed to get valid JSON response"})
                 
-                # Validate it's valid JSON
-                json.loads(json_text)  # This will raise an error if not valid JSON
-                
-                if self.debug:
-                    self._log(f"Raw response: {raw_text}")
-                    self._log(f"Extracted JSON: {json_text}")
-                
-                return json_text, None
-                
-            except json.JSONDecodeError:
-                if self.debug:
-                    self._log(f"Failed to extract valid JSON from: {raw_text}")
-                return None, "Failed to get valid JSON response"
-                
-        except Exception as e:
-            self._log(f"Error in prediction: {str(e)}")
-            return None, str(e)
+            except Exception as e:
+                self._log(f"Error processing transaction: {str(e)}")
+                all_results.append({"error": str(e)})
+        
+        return json.dumps(all_results), None
 
     def get_active_jobs(self):
         """Get list of active fine-tuning jobs"""
