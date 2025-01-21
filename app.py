@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 from database import Database
 import unicodedata
-from auth import init_auth, login, signup, logout
+from auth import init_auth, login, signup, logout, show_auth_ui
 
 
 REQUIRED_COLUMNS = ['Description', 'Amount', 'Category', 'PaymentAccount', 'Vendor', 'TaxCategory']
@@ -352,25 +352,110 @@ def show_predictions_history():
     else:
         st.info("No prediction history available")
 
+def show_card_management():
+    """Show card management section"""
+    st.subheader("💳 Card Management")
+    
+    # Get user's cards
+    cards = st.session_state.supabase.table('cards')\
+        .select('*')\
+        .eq('user_id', st.session_state.user.id)\
+        .execute()
+    
+    # Show existing cards
+    if cards.data:
+        # Add a styled header for the cards list
+        st.markdown("""
+            <div style="
+                background-color: #f0f2f6;
+                padding: 10px 15px;
+                border-radius: 5px;
+                margin-bottom: 10px;
+                display: flex;
+                justify-content: space-between;
+                font-weight: bold;
+            ">
+                <div style="width: 40%">Card Name</div>
+                <div style="width: 40%">Type</div>
+                <div style="width: 20%">Actions</div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        for card in cards.data:
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                st.write(f"**{card['name']}**")
+            with col2:
+                st.write(card['card_type'])
+            with col3:
+                if st.button("🗑️", key=f"delete_{card['id']}", help="Delete card"):
+                    try:
+                        # Delete the card
+                        st.session_state.supabase.table('cards')\
+                            .delete()\
+                            .eq('id', card['id'])\
+                            .eq('user_id', st.session_state.user.id)\
+                            .execute()
+                        st.success(f"Deleted card: {card['name']}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error deleting card: {str(e)}")
+    else:
+        st.info("No cards added yet. Add your first card below!")
+    
+    # Add new card
+    with st.expander("➕ Add New Card"):
+        with st.form("add_card"):
+            # Card type selection
+            card_type = st.selectbox(
+                "Card Type",
+                options=["", "AMEX - Business", "AMEX - Personal"],
+                key="new_card_type"
+            )
+            
+            # Simple name input
+            name = st.text_input(
+                "Card Name",
+                key="new_card_name",
+                help="Must be unique"
+            )
+            
+            if st.form_submit_button("Add Card"):
+                if not card_type or not name:
+                    st.error("Please fill in all fields")
+                else:
+                    try:
+                        response = st.session_state.supabase.table('cards').insert({
+                            'user_id': st.session_state.user.id,
+                            'name': name,
+                            'card_type': card_type
+                        }).execute()
+                        st.success(f"Added card: {name}")
+                        st.rerun()
+                    except Exception as e:
+                        if "unique_card_name" in str(e):
+                            st.error("A card with this name already exists")
+                        else:
+                            st.error(f"Error adding card: {str(e)}")
+
 def main():
     # Initialize authentication
     init_auth()
     
-    # Show auth status in sidebar
-    with st.sidebar:
-        if st.session_state.user:
-            st.write(f"Logged in as: {st.session_state.user.email}")
-            if st.button("Logout"):
-                logout()
-        else:
-            tab1, tab2 = st.tabs(["Login", "Sign Up"])
-            with tab1:
-                login()
-            with tab2:
-                signup()
+    if st.session_state.get('debug_mode'):
+        st.sidebar.write("Auth Debug:")
+        st.sidebar.write("User:", st.session_state.user)
+        st.sidebar.write("Has token:", 'auth_token' in st.session_state)
     
-    # Only show main app if user is logged in
+    # Show auth status in sidebar
     if st.session_state.user:
+        with st.sidebar:
+            st.write(f"👤 Logged in as:")
+            st.info(st.session_state.user.email)
+            if st.button("🚪 Logout", use_container_width=True):
+                logout()
+        
+        # Main app content
         print(sys.executable)
         # Add debug mode toggle at the top
         debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
@@ -379,126 +464,118 @@ def main():
         
         st.title("Tax Classification Assistant")
         
-        # Provider selection with Predibase as default
-        provider = st.radio(
-            "Select Provider",
-            options=[ModelProvider.PREDIBASE, ModelProvider.TOGETHER],
-            format_func=lambda x: x.value.title(),
-            horizontal=True,
-            index=0
-        )
-        
-        # Get API key and tenant ID for selected provider
-        default_key = get_env_value('PREDIBASE_API_KEY' if provider == ModelProvider.PREDIBASE else 'TOGETHER_API_KEY')
-        api_key = st.text_input(
-            f"{provider.value.title()} API Key", 
-            value=default_key if default_key else "",
-            type="password"
-        )
-
-        # Add tenant ID input for Predibase
-        tenant_id = None
-        if provider == ModelProvider.PREDIBASE:
-            default_tenant = get_env_value('PREDIBASE_TENANT_ID')
-            tenant_id = st.text_input(
-                "Predibase Tenant ID",
-                value=default_tenant if default_tenant else "",
-                type="password",
-                help="Enter your Predibase tenant ID"
-            )
-            if tenant_id:
-                os.environ['PREDIBASE_TENANT_ID'] = tenant_id
+        # Get API credentials from secrets (no UI needed)
+        api_key = get_env_value('PREDIBASE_API_KEY')
+        tenant_id = get_env_value('PREDIBASE_TENANT_ID')
         
         if debug_mode:
             st.sidebar.write("Debug Information:")
-            st.sidebar.write(f"Selected Provider: {provider.value}")
-            st.sidebar.write(f"Default API Key found: {bool(default_key)}")
-            st.sidebar.write(f"Current API Key length: {len(api_key) if api_key else 0}")
-            if provider == ModelProvider.PREDIBASE:
-                st.sidebar.write(f"Tenant ID: {tenant_id}")
+            st.sidebar.write(f"API Key found: {bool(api_key)}")
+            st.sidebar.write(f"Tenant ID found: {bool(tenant_id)}")
         
-        # Only proceed if we have all required credentials
-        if api_key and (provider != ModelProvider.PREDIBASE or tenant_id):
-            # Create API client based on selected provider
+        # Set environment variable for tenant ID
+        if tenant_id:
+            os.environ['PREDIBASE_TENANT_ID'] = tenant_id
+        
+        # Create API client (always use Predibase)
+        if api_key and tenant_id:
             with st.spinner("Initializing API client..."):
-                api = ModelFactory.create(provider, api_key, debug=debug_mode)
+                api = ModelFactory.create(ModelProvider.PREDIBASE, api_key, debug=debug_mode)
             
             # Create tabs for different sections
-            tab1, tab2 = st.tabs(["Process Transactions", "View History"])
+            tab1, tab2, tab3 = st.tabs([
+                "💳 Card Management",
+                "📤 Upload Transactions", 
+                "📋 View History"
+            ])
             
             with tab1:
-                # Account type selection
-                account_type = st.radio(
-                    "Select Account Type",
-                    options=["Personal", "Business"],
-                    horizontal=True
-                )
-                
-                # File upload for predictions
-                uploaded_file = st.file_uploader("Upload Amex CSV", type=['csv'])
-                
-                if uploaded_file is not None:
-                    df, error = read_csv_with_encoding(uploaded_file)
-                    if error:
-                        st.error(error)
-                    else:
-                        try:
-                            df_prepared = prepare_amex_data(df, account_type)
-                            
-                            # Show preview of prepared data
-                            st.subheader("Data Preview")
-                            st.dataframe(df_prepared.head())
-                            
-                            if st.button("Process First 2 Transactions"):
-                                with st.spinner("Processing initial transactions..."):
-                                    result_df, remaining_df = process_predictions(df_prepared, None, api, preview_only=True)
-                                    
-                                    # Show results
-                                    st.subheader("Preview Results")
-                                    st.dataframe(result_df)
-                                    
-                                    # Show action buttons
-                                    col1, col2, col3 = st.columns(3)
-                                    
-                                    with col1:
-                                        if st.button("Process Remaining Transactions"):
-                                            if remaining_df is not None and not remaining_df.empty:
-                                                with st.spinner("Processing remaining transactions..."):
-                                                    full_result_df, _ = process_predictions(remaining_df, None, api, preview_only=False)
-                                                    st.subheader("All Results")
-                                                    st.dataframe(pd.concat([result_df, full_result_df]))
-                                                    
-                                                    # Download button for all results
-                                                    csv = pd.concat([result_df, full_result_df]).to_csv(index=False)
-                                                    st.download_button(
-                                                        label="Download All Results CSV",
-                                                        data=csv,
-                                                        file_name="all_predictions.csv",
-                                                        mime="text/csv"
-                                                    )
-                                    
-                                    with col2:
-                                        if st.button("Custom Mappings", disabled=True):
-                                            st.info("Custom mappings feature coming soon!")
-                                    
-                                    with col3:
-                                        if st.button("Custom Tax Categories", disabled=True):
-                                            st.info("Custom tax categories feature coming soon!")
-                                    
-                                    # Download button for preview results
-                                    csv = result_df.to_csv(index=False)
-                                    st.download_button(
-                                        label="Download Preview Results CSV",
-                                        data=csv,
-                                        file_name="preview_predictions.csv",
-                                        mime="text/csv"
-                                    )
-                        
-                        except Exception as e:
-                            st.error(f"Error processing data: {str(e)}")
+                show_card_management()
             
             with tab2:
+                # Get user's cards for selection
+                cards = st.session_state.supabase.table('cards')\
+                    .select('*')\
+                    .eq('user_id', st.session_state.user.id)\
+                    .execute()
+                    
+                if not cards.data:
+                    st.info("Please add a card in the Card Management section first")
+                else:
+                    # Card selection
+                    selected_card = st.selectbox(
+                        "Select Card",
+                        options=cards.data,
+                        format_func=lambda x: x['name']
+                    )
+                    
+                    # File upload
+                    uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+                    
+                    if uploaded_file is not None:
+                        df, error = read_csv_with_encoding(uploaded_file)
+                        if error:
+                            st.error(error)
+                        else:
+                            try:
+                                df_prepared = prepare_amex_data(df, selected_card['card_type'])
+                                
+                                # Show preview of prepared data
+                                st.subheader("Data Preview")
+                                st.dataframe(df_prepared.head())
+                                
+                                if st.button("Process First 2 Transactions"):
+                                    with st.spinner("Processing initial transactions..."):
+                                        result_df, remaining_df = process_predictions(df_prepared, None, api, preview_only=True)
+                                        
+                                        # Show results
+                                        st.subheader("Preview Results")
+                                        st.dataframe(result_df)
+                                        
+                                        # Show action buttons
+                                        col1, col2, col3 = st.columns(3)
+                                        
+                                        with col1:
+                                            if st.button("Process Remaining Transactions"):
+                                                if remaining_df is not None and not remaining_df.empty:
+                                                    with st.spinner("Processing remaining transactions..."):
+                                                        full_result_df, _ = process_predictions(remaining_df, None, api, preview_only=False)
+                                                        st.subheader("All Results")
+                                                        st.dataframe(pd.concat([result_df, full_result_df]))
+                                                        
+                                                        # Download button for all results
+                                                        csv = pd.concat([result_df, full_result_df]).to_csv(index=False)
+                                                        st.download_button(
+                                                            label="Download All Results CSV",
+                                                            data=csv,
+                                                            file_name="all_predictions.csv",
+                                                            mime="text/csv"
+                                                        )
+                                        
+                                        with col2:
+                                            if st.button("Custom Mappings", disabled=True):
+                                                st.info("Custom mappings feature coming soon!")
+                                        
+                                        with col3:
+                                            if st.button("Custom Tax Categories", disabled=True):
+                                                st.info("Custom tax categories feature coming soon!")
+                                        
+                                        # Download button for preview results
+                                        csv = result_df.to_csv(index=False)
+                                        st.download_button(
+                                            label="Download Preview Results CSV",
+                                            data=csv,
+                                            file_name="preview_predictions.csv",
+                                            mime="text/csv"
+                                        )
+                            
+                            except Exception as e:
+                                st.error(f"Error processing data: {str(e)}")
+            
+            with tab3:
                 show_predictions_history()
+    else:
+        show_auth_ui()
 
 if __name__ == "__main__":
     main()
